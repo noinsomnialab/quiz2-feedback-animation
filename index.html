@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Style Analysis</title>
+  <style>
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background: #ffffff;
+      display: flex;
+      justify-content: center;
+      padding: 40px 20px;
+      min-height: 100vh;
+    }
+
+    .wrap {
+      width: 100%;
+      max-width: 450px;
+    }
+
+    .scan-ctr {
+      position: relative;
+      width: 100%;
+    }
+
+    #c {
+      display: block;
+      width: 100%;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <div class="scan-ctr"><canvas id="c"></canvas></div>
+  </div>
+  <script>
+    (function () {
+      'use strict';
+
+      /* ── TIMING ─────────────────────────────────────── */
+      const CARD_SHOW_MS = 1400;   // each styled photo visible (faster)
+      const CARD_TRANS_MS = 600;    // card swap animation (total 3s loop per card)
+      const SCAN_PERIOD = 3800;   // scanline loop on left
+
+      /* ── DOT MESH (Full frame algorithmic mesh) ──────── */
+      const DOTS = [];
+      const CONN = [];
+      const cols = 7, rows = 10; // Denser square grid
+      
+      // Fixed random generator for consistent jitter
+      function PRNG(s) { return function() { s=Math.sin(s)*10000; return s-Math.floor(s); }; }
+      const rand = PRNG(42);
+
+      for (let r = 0; r < rows; r++) {
+         for (let c = 0; c < cols; c++) {
+            // Span perfectly from -0.15 to 1.15 to ensure full coverage and outward bleeding
+            const nx = -0.15 + (c / (cols - 1)) * 1.30; 
+            const ny = -0.15 + (r / (rows - 1)) * 1.30;
+            
+            // Add a little bit of structural 'mess' (mild jitter)
+            const jx = (rand() - 0.5) * 0.09;
+            const jy = (rand() - 0.5) * 0.09;
+            DOTS.push([nx + jx, ny + jy]);
+         }
+      }
+      for (let r = 0; r < rows; r++) {
+         for (let c = 0; c < cols; c++) {
+            const i = r * cols + c;
+            
+            // Orthogonal connections, but randomly break ~15% of them for a "glitchy" broken grid feel
+            if (c < cols - 1 && rand() > 0.15) CONN.push([i, i + 1]);
+            if (r < rows - 1 && rand() > 0.15) CONN.push([i, i + cols]);
+            
+            // Add a rare diagonal (~10% chance) to break up the perfect square repetition
+            if (r < rows - 1 && c < cols - 1 && rand() > 0.90) {
+                if (rand() > 0.5) CONN.push([i, i + cols + 1]);
+                else CONN.push([i + 1, i + cols]);
+            }
+         }
+      }
+
+      const SEEDS = DOTS.map((_, i) => ({
+        px: i * 1.37, py: i * 0.89,
+        fx: 0.55 + (i % 5) * 0.10, fy: 0.45 + (i % 7) * 0.09,
+        // Increased drifting amplitude slightly to make the messiness feel dynamic
+        ax: 0.9 + (i % 4) * 0.4, ay: 0.7 + (i % 3) * 0.4,
+      }));
+
+      // Random angles for stacked cards (in radians)
+      const ANGLES = [0.05, -0.04, 0.08, -0.07, 0.03, -0.06, 0.06, -0.03];
+
+      /* ── STATE ──────────────────────────────────────── */
+      const canvas = document.getElementById('c');
+      const ctx = canvas.getContext('2d');
+      let dpr = 1, cw = 0, ch = 0, aspect = 1.33;
+      let origImg, styled = [];
+      let LP = {}, RP = {};           // left / right panel bounds
+
+      let rIdx = 0;              // current styled photo index
+      let rMode = 'show';         // 'show' | 'trans'
+      let rT0 = 0;
+
+      /* ── LOAD ───────────────────────────────────────── */
+      origImg = new Image();
+      origImg.src = 'photos/original.jpg';
+
+      // Dynamically load ALL photos from photos/styled/ directory.
+      // Note: This works seamlessly with local test servers (like python http.server).
+      // If deployed to a production site with directory-listing disabled, you will need to list files manually.
+      function loadStyledPhotos() {
+        return fetch('photos/styled/')
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, 'text/html');
+            // Find all links to images
+            const links = Array.from(doc.querySelectorAll('a'));
+            const imageFiles = links
+              .map(a => a.getAttribute('href'))
+              .filter(href => href && href.match(/\.(jpe?g|png|avif|webp)$/i))
+              // ensure it doesn't duplicate path if href is relative
+              .map(href => 'photos/styled/' + href.split('/').pop());
+
+            if (imageFiles.length === 0) {
+              console.warn("No images found in parsing, falling back to sequential loader.");
+              return fallbackSequentialLoader();
+            }
+
+            return Promise.all(imageFiles.map(src => new Promise(resolve => {
+              const img = new Image();
+              img.onload = () => { styled.push(img); resolve(); };
+              img.onerror = () => resolve();
+              img.src = src;
+            })));
+          })
+          .catch(() => {
+            // Fallback to sequential loader if directory listing is turned off or failed
+            return fallbackSequentialLoader();
+          });
+      }
+
+      function fallbackSequentialLoader() {
+        return new Promise(resolve => {
+          let idx = 1;
+          function next() {
+            if (idx > 20) return resolve();
+            const img = new Image();
+            img.onload = () => { styled.push(img); idx++; next(); };
+            img.onerror = () => { resolve(); };
+            img.src = `photos/styled/v${idx}.jpg`;
+          }
+          next();
+        });
+      }
+
+      Promise.all([
+        new Promise(r => { origImg.onload = r; }),
+        loadStyledPhotos()
+      ]).then(() => {
+        if (styled.length === 0) styled = [origImg]; // fallback
+        aspect = origImg.naturalHeight / origImg.naturalWidth;
+        resize();
+        window.addEventListener('resize', resize);
+        rT0 = performance.now();
+        requestAnimationFrame(tick);
+      });
+
+      /* ── RESIZE ─────────────────────────────────────── */
+      function resize() {
+        dpr = window.devicePixelRatio || 1;
+        const W = canvas.parentElement.clientWidth;
+        const PAD = Math.round(W * 0.022);
+        const GAP = Math.round(W * 0.048);
+        // Extra padding around the right to account for rotated cards without clipping
+        const ROT_PAD = Math.round(W * 0.06);
+
+        // We want the left photo width (pw) and right photo width (pw) to be equal, 
+        // but the right side needs visual breathing room for the rotation.
+        // Let's keep the actual image area equal.
+        const pw = Math.floor((W - PAD * 2 - GAP - ROT_PAD * 1.5) / 2);
+        const ph = Math.round(pw * aspect);
+        const LB = Math.round(ph * 0.09); // label strip height
+        cw = W; ch = PAD + ph + PAD + LB + ROT_PAD;
+
+        LP = { x: PAD, y: PAD + ROT_PAD / 2, w: pw, h: ph };
+        RP = { x: PAD + pw + GAP, y: PAD + ROT_PAD / 2, w: pw, h: ph };
+
+        canvas.width = Math.round(cw * dpr);
+        canvas.height = Math.round(ch * dpr);
+        canvas.style.width = cw + 'px';
+        canvas.style.height = ch + 'px';
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.scale(dpr, dpr);
+      }
+
+      /* ── TICK ───────────────────────────────────────── */
+      function tick(now) {
+        requestAnimationFrame(tick);
+        ctx.clearRect(0, 0, cw, ch);
+        drawLeft(now);
+
+        const el = now - rT0;
+        if (rMode === 'show') {
+          drawShow(now, Math.min(el / CARD_SHOW_MS, 1));
+          if (el >= CARD_SHOW_MS) { rMode = 'trans'; rT0 = now; }
+        } else {
+          const tp = eio(Math.min(el / CARD_TRANS_MS, 1));
+          drawTrans(tp);
+          if (el >= CARD_TRANS_MS) { rIdx = (rIdx + 1) % styled.length; rMode = 'show'; rT0 = now; }
+        }
+        drawLabels();
+      }
+
+      /* ── EASING ─────────────────────────────────────── */
+      function eio(t) { return t < .5 ? 2 * t * t : -1 + (4 - 2 * t) * t; }
+
+      /* ── HELPERS ────────────────────────────────────── */
+      function coverImg(img, x, y, w, h, scale) {
+        scale = scale || 1;
+        const ia = img.naturalWidth / img.naturalHeight, ra = w / h;
+        let dw, dh;
+        if (ia > ra) { dh = h * scale; dw = dh * ia; } else { dw = w * scale; dh = dw / ia; }
+        ctx.drawImage(img, x + w * .5 - dw * .5, y + h * .5 - dh * .5, dw, dh);
+      }
+
+      // Draw photo card with rounded clip + angle + optional white outer border for stacked effect
+      function card(img, panel, alpha, rAngle, xOff, yOff, scale) {
+        const rx = panel.x + panel.w / 2 + (xOff || 0);
+        const ry = panel.y + panel.h / 2 + (yOff || 0);
+        const w = panel.w;
+        const h = panel.h;
+        const r = Math.round(w * .03);
+
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.translate(rx, ry);
+        ctx.rotate(rAngle || 0);
+        if (scale && scale !== 1) {
+          ctx.scale(scale, scale);
+        }
+        ctx.translate(-w / 2, -h / 2);
+
+        // Draw white background "card" rim to distinguish stacked photos
+        ctx.beginPath();
+        ctx.moveTo(r, 0); ctx.lineTo(w - r, 0); ctx.quadraticCurveTo(w, 0, w, r);
+        ctx.lineTo(w, h - r); ctx.quadraticCurveTo(w, h, w - r, h);
+        ctx.lineTo(r, h); ctx.quadraticCurveTo(0, h, 0, h - r);
+        ctx.lineTo(0, r); ctx.quadraticCurveTo(0, 0, r, 0);
+        ctx.closePath();
+        ctx.shadowColor = "rgba(0,0,0,0.15)";
+        ctx.shadowBlur = 12;
+        ctx.shadowOffsetY = 4;
+        ctx.fillStyle = "#fff";
+        ctx.fill();
+        ctx.shadowColor = "transparent";
+
+        // Image inside
+        ctx.clip();
+        coverImg(img, 0, 0, w, h, 1);
+        ctx.restore();
+      }
+
+      function rrClip(x, y, w, h, r) {
+        ctx.beginPath();
+        ctx.moveTo(x + r, y); ctx.lineTo(x + w - r, y);
+        ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+        ctx.lineTo(x + w, y + h - r);
+        ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+        ctx.lineTo(x + r, y + h);
+        ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+        ctx.lineTo(x, y + r);
+        ctx.quadraticCurveTo(x, y, x + r, y);
+        ctx.closePath();
+        ctx.clip();
+      }
+
+      // Dot position with floating animation
+      function dpos(i, panel, now) {
+        const s = SEEDS[i], T = now / 1000;
+        return [
+          panel.x + DOTS[i][0] * panel.w + Math.sin(T * s.fx + s.px) * s.ax,
+          panel.y + DOTS[i][1] * panel.h + Math.cos(T * s.fy + s.py) * s.ay,
+        ];
+      }
+
+      // Corner brackets (Left side only)
+      function brackets(panel, alpha) {
+        const { x, y, w, h } = panel;
+        const sz = Math.min(w, h) * .11, mg = sz * .45;
+        ctx.save();
+        ctx.strokeStyle = `rgba(255,255,255,${alpha * .85})`;
+        ctx.lineWidth = Math.max(.8, 1.3 * (cw / 450));
+        ctx.lineCap = 'round';
+        ctx.shadowBlur = 7; ctx.shadowColor = `rgba(255,255,255,${alpha * .6})`;
+        [[x + mg, y + mg, 1, 1], [x + w - mg, y + mg, -1, 1], [x + mg, y + h - mg, 1, -1], [x + w - mg, y + h - mg, -1, -1]]
+          .forEach(([cx, cy, dx, dy]) => {
+            ctx.beginPath();
+            ctx.moveTo(cx + dx * sz, cy); ctx.lineTo(cx, cy); ctx.lineTo(cx, cy + dy * sz);
+            ctx.stroke();
+          });
+        ctx.restore();
+      }
+
+      /* ── LEFT PANEL: original + AI scan ─────────────── */
+      function drawLeft(now) {
+        const { x, y, w, h } = LP;
+        const r = Math.round(w * .03);
+        const scanY = y + ((now % SCAN_PERIOD) / SCAN_PERIOD) * h;
+
+        // Photo
+        ctx.save(); rrClip(x, y, w, h, r); coverImg(origImg, x, y, w, h, 1); ctx.restore();
+
+        // AI overlay (clipped)
+        ctx.save(); rrClip(x, y, w, h, r);
+
+        const MA = 0.55; // slightly brighter since it covers the whole screen now
+
+        // Lines covering the whole picture
+        CONN.forEach(([a, b]) => {
+          const [ax, ay] = dpos(a, LP, now), [bx, by] = dpos(b, LP, now);
+          
+          // Add a localized glow when the scanline passes over the line center
+          const distToScan = Math.abs((ay + by) / 2 - scanY);
+          const scanPulse = Math.max(0, 1 - (distToScan / 80));
+          const lineAlpha = MA * .35 + (0.45 * scanPulse);
+
+          ctx.save();
+          ctx.strokeStyle = `rgba(255,255,255,${lineAlpha})`;
+          ctx.lineWidth = Math.max(.5, .8 * (w / 200));
+          ctx.shadowBlur = 4; ctx.shadowColor = 'rgba(255,255,255,.3)';
+          ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+          ctx.restore();
+        });
+
+        // Dots covering the whole picture
+        const dr = Math.max(1.4, 2.2 * (w / 200));
+        DOTS.forEach((dot, i) => {
+          // Hide dots near or outside edges so lines bleed cleanly out of frame and end abruptly.
+          if (dot[0] < 0.04 || dot[0] > 0.96 || dot[1] < 0.04 || dot[1] > 0.96) return; 
+
+          const [px, py] = dpos(i, LP, now);
+          
+          // Breathe continuously + flash brighter near scanline
+          let pulse = .7 + .3 * Math.sin(now / 750 + i * 1.1);
+          const distToScan = Math.abs(py - scanY);
+          if (distToScan < 30) pulse += (1 - distToScan / 30) * 1.2;
+
+          ctx.save();
+          ctx.shadowBlur = 9; ctx.shadowColor = `rgba(255,255,255,${MA * pulse})`;
+          ctx.fillStyle = `rgba(255,255,255,${MA * pulse})`;
+          ctx.beginPath(); ctx.arc(px, py, dr, 0, Math.PI * 2); ctx.fill();
+          ctx.restore();
+        });
+
+        // Scanline glow band
+        const band = ctx.createLinearGradient(0, scanY - 26, 0, scanY + 12);
+        band.addColorStop(0, 'rgba(255,255,255,0)');
+        band.addColorStop(.75, 'rgba(255,255,255,.18)');
+        band.addColorStop(1, 'rgba(255,255,255,.05)');
+        ctx.fillStyle = band; ctx.fillRect(x, scanY - 26, w, 38);
+
+        // Scanline
+        ctx.strokeStyle = 'rgba(255,255,255,.85)';
+        ctx.lineWidth = Math.max(.7, 1.2 * (w / 200));
+        ctx.shadowBlur = 13; ctx.shadowColor = 'rgba(255,255,255,.9)';
+        ctx.beginPath(); ctx.moveTo(x, scanY); ctx.lineTo(x + w, scanY); ctx.stroke();
+
+        ctx.restore();
+        brackets(LP, .55);
+      }
+
+      /* ── RIGHT PANEL: styled cards dropping onto pile ── */
+      const OFF = 5; // offset in pixels for stacked layers
+
+      function drawShow(now, p) {
+        if (styled.length <= 1) {
+          card(styled[0], RP, 1, 0, 0, 0, 1); return;
+        }
+        const L = styled.length;
+        const pi1 = (rIdx - 1 + L) % L;
+        const pi2 = (rIdx - 2 + L) % L;
+
+        if (L > 2) {
+          card(styled[pi2], RP, 1, ANGLES[pi2 % ANGLES.length], -OFF * 2, -OFF * 2, 1);
+        }
+        if (L > 1) {
+          card(styled[pi1], RP, 1, ANGLES[pi1 % ANGLES.length], -OFF, -OFF, 1);
+        }
+        card(styled[rIdx], RP, 1, ANGLES[rIdx % ANGLES.length], 0, 0, 1);
+      }
+
+      function drawTrans(tp) {
+        if (styled.length <= 1) {
+          card(styled[0], RP, 1, 0, 0, 0, 1); return;
+        }
+        const L = styled.length;
+        const pi1 = (rIdx - 1 + L) % L;
+        const pi2 = (rIdx - 2 + L) % L;
+        const ni = (rIdx + 1) % L;
+
+        // Oldest card (pi2) fades out and moves further back
+        if (L > 2) {
+          card(styled[pi2], RP, 1 - tp, ANGLES[pi2 % ANGLES.length], -OFF * 2 - OFF * tp, -OFF * 2 - OFF * tp, 1);
+        }
+
+        // pi1 moves back to pi2 position
+        if (L > 1) {
+          card(styled[pi1], RP, 1, ANGLES[pi1 % ANGLES.length], -OFF - OFF * tp, -OFF - OFF * tp, 1);
+        }
+
+        // Current top card (rIdx) moves back to pi1 position
+        // User requested "slightly make the first one transparent to avoid shivering"
+        // We dip opacity during transition and return to 1.0 to avoid harsh overlapping edges as they move.
+        const oldAlpha = 1.0 - Math.sin(tp * Math.PI) * 0.15;
+        card(styled[rIdx], RP, oldAlpha, ANGLES[rIdx % ANGLES.length], -OFF * tp, -OFF * tp, 1);
+
+        // New card enters from top (above) + right, scaling down to pile
+        const dropY = -RP.h * 0.22 * (1 - tp);
+        const dropX = RP.w * 0.15 * (1 - tp);
+        const scale = 1.0 + 0.08 * (1 - tp);
+        const targetAngle = ANGLES[ni % ANGLES.length];
+        const dropAngle = targetAngle + (0.05 * (1 - tp));
+
+        card(styled[ni], RP, tp, dropAngle, dropX, dropY, scale);
+      }
+
+      /* ── LABELS ─────────────────────────────────────── */
+      function drawLabels() {
+        const fs = Math.max(10, Math.round(11 * (cw / 450)));
+        const ly = LP.y + LP.h + fs * 2.0;
+        ctx.save();
+        ctx.font = `600 ${fs}px -apple-system, BlinkMacSystemFont, sans-serif`;
+        ctx.fillStyle = 'rgba(15,15,15,0.9)'; // Black text
+        ctx.textAlign = 'center';
+        ctx.fillText('ORIGINAL PHOTO', LP.x + LP.w * .5, ly);
+        ctx.fillText('AI STYLED', RP.x + RP.w * .5, ly);
+        ctx.restore();
+      }
+
+    })();
+  </script>
+</body>
+
+</html>
